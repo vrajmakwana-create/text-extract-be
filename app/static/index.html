@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Text Extraction</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Segoe UI", sans-serif;
+      background: #f4f6f8;
+      color: #1c2430;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+    }
+    main {
+      max-width: 820px;
+      margin: 0 auto;
+      padding: 40px 20px 64px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 1.7rem;
+    }
+    p.lead {
+      margin: 0 0 24px;
+      color: #526070;
+    }
+    form {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      background: white;
+      border: 1px solid #d9e0e7;
+      border-radius: 12px;
+      padding: 16px;
+    }
+    input[type="file"] {
+      flex: 1;
+      min-width: 220px;
+    }
+    button {
+      background: #1f6feb;
+      color: white;
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 16px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: wait;
+    }
+    .error {
+      margin-top: 16px;
+      color: #9f1d1d;
+    }
+    .metrics {
+      display: flex;
+      gap: 12px;
+      margin-top: 20px;
+      flex-wrap: wrap;
+    }
+    .metric {
+      background: white;
+      border: 1px solid #d9e0e7;
+      border-radius: 12px;
+      padding: 14px 16px;
+      min-width: 180px;
+    }
+    .metric span {
+      display: block;
+      color: #526070;
+      font-size: 0.85rem;
+    }
+    .metric strong {
+      font-size: 1.6rem;
+    }
+    .legend {
+      margin: 18px 0 8px;
+      color: #526070;
+      font-size: 0.92rem;
+    }
+    .legend mark {
+      padding: 0 0.25em;
+    }
+    article {
+      background: white;
+      border: 1px solid #d9e0e7;
+      border-radius: 12px;
+      padding: 20px;
+      white-space: pre-wrap;
+      line-height: 1.55;
+    }
+    mark {
+      background: #fde68a;
+      color: inherit;
+      border-radius: 0.25em;
+      padding: 0 0.15em;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Text extraction</h1>
+    <p class="lead">Upload a PDF, Word, or image file. Text read from images is highlighted.</p>
+    <form id="form">
+      <input id="file" type="file" accept=".pdf,.docx,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp,application/pdf,image/*" required>
+      <button id="submit" type="submit">Extract</button>
+    </form>
+    <p id="error" class="error" hidden></p>
+    <section id="result" hidden>
+      <div class="metrics">
+        <div class="metric"><span>Images detected</span><strong id="detected">0</strong></div>
+        <div class="metric"><span>Images converted to text</span><strong id="converted">0</strong></div>
+      </div>
+      <p class="legend">Highlighted text was read from an image.</p>
+      <article id="output"></article>
+    </section>
+  </main>
+  <script>
+    const form = document.getElementById("form");
+    const fileInput = document.getElementById("file");
+    const submit = document.getElementById("submit");
+    const error = document.getElementById("error");
+    const result = document.getElementById("result");
+    const output = document.getElementById("output");
+
+    function showResult(payload) {
+      document.getElementById("detected").textContent = payload.metrics.images_detected;
+      document.getElementById("converted").textContent = payload.metrics.images_with_text;
+      output.replaceChildren();
+      for (const segment of payload.segments) {
+        if (segment.source === "image") {
+          const mark = document.createElement("mark");
+          mark.textContent = segment.text;
+          mark.title = segment.page ? "From an image on page " + segment.page : "From an image";
+          output.appendChild(mark);
+        } else {
+          output.appendChild(document.createTextNode(segment.text));
+        }
+      }
+      result.hidden = false;
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.hidden = true;
+      result.hidden = true;
+      const file = fileInput.files[0];
+      if (!file) return;
+
+      const body = new FormData();
+      body.append("file", file);
+      submit.disabled = true;
+      try {
+        const response = await fetch("/extract", { method: "POST", body });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.detail || "Could not read this document");
+        }
+        showResult(payload);
+      } catch (err) {
+        error.textContent = err.message;
+        error.hidden = false;
+      } finally {
+        submit.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
