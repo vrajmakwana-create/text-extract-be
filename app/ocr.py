@@ -237,12 +237,113 @@ def _trocr_text(image: Image.Image) -> str:
     return join_lines(reading_order(items, max(page_width, 1.0)))
 
 
+LIGHTON_URL = os.environ.get("LIGHTON_URL", "http://127.0.0.1:8000/v1/chat/completions")
+LIGHTON_MODEL = os.environ.get("LIGHTON_MODEL", "lightonai/LightOnOCR-3-0.8B")
+LIGHTON_MAX_EDGE = 2048  # the model card renders pages to a 2048 px longest edge
+
+
+def _lighton_text(image: Image.Image) -> str:
+    """Transcribe one region with LightOnOCR through vLLM's OpenAI-compatible API."""
+    import base64
+    import json
+    import urllib.request
+
+    if max(image.size) > LIGHTON_MAX_EDGE:
+        image = image.copy()
+        image.thumbnail((LIGHTON_MAX_EDGE, LIGHTON_MAX_EDGE), Image.Resampling.LANCZOS)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    payload = {
+        "model": LIGHTON_MODEL,
+        # An empty prompt (image only) is LightOnOCR's transcription mode.
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
+        ]}],
+        "max_tokens": 4096,
+        "temperature": 0.2,
+        "top_p": 0.9,
+    }
+    request = urllib.request.Request(
+        LIGHTON_URL, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            body = json.load(response)
+    except Exception as exc:
+        raise OCRUnavailable("LightOnOCR server is not reachable") from exc
+    return (body["choices"][0]["message"]["content"] or "").strip()
+
+
+# A full-page region takes ~1,500 output tokens, and one request decodes about
+# 30 tokens/s on the fractional GPU. vLLM batches concurrent requests, so tall
+# regions are cut at blank gaps between paragraphs and the strips read at once.
+LIGHTON_STRIP_PX = int(os.environ.get("LIGHTON_STRIP_PX", "320"))
+LIGHTON_PARALLEL = max(1, int(os.environ.get("LIGHTON_PARALLEL", "8")))
+
+
+def _blank_gap_cuts(image: Image.Image, target: int) -> list[int]:
+    """Row positions in blank horizontal bands, about `target` px apart."""
+    import numpy as np
+
+    gray = np.asarray(image.convert("L"), dtype=np.uint8)
+    ink = (gray < 160).sum(axis=1)
+    blank = ink <= max(2, int(image.width * 0.015))  # tolerate thin rules and box edges
+    min_gap = max(4, image.height // 250)
+
+    gaps: list[int] = []  # centre of each blank run that is tall enough
+    run_start = None
+    for row, is_blank in enumerate(list(blank) + [False]):
+        if is_blank and run_start is None:
+            run_start = row
+        elif not is_blank and run_start is not None:
+            if row - run_start >= min_gap and run_start > 0 and row < image.height:
+                gaps.append((run_start + row) // 2)
+            run_start = None
+
+    cuts: list[int] = []
+    last = 0
+    for gap in gaps:
+        if gap - last >= target and image.height - gap >= target // 2:
+            cuts.append(gap)
+            last = gap
+    return cuts
+
+
+def _strips(image: Image.Image) -> list[Image.Image]:
+    """Cut one column into strips at blank gaps."""
+    cuts = _blank_gap_cuts(image, LIGHTON_STRIP_PX) if image.height > LIGHTON_STRIP_PX * 1.5 else []
+    edges = [0, *cuts, image.height]
+    return [image.crop((0, top, image.width, bottom)) for top, bottom in zip(edges, edges[1:])]
+
+
+def _lighton_region(image: Image.Image) -> str:
+    """Read a region as columns, then strips, all in parallel, joined in reading order."""
+    columns = [image]
+    gutter = find_image_gutter(image) if image.height > LIGHTON_STRIP_PX * 1.5 else None
+    if gutter is not None:
+        pad = max(4, int(image.width * 0.01))
+        columns = [
+            image.crop((0, 0, min(image.width, gutter + pad), image.height)),
+            image.crop((max(0, gutter - pad), 0, image.width, image.height)),
+        ]
+    pieces = [strip for column in columns for strip in _strips(column)]
+    if len(pieces) == 1:
+        return _lighton_text(pieces[0])
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(min(LIGHTON_PARALLEL, len(pieces))) as pool:
+        texts = list(pool.map(_lighton_text, pieces))
+    return "\n\n".join(text for text in texts if text)
+
 def _read(image: Image.Image) -> str:
     engine = _ocr_engine_name()
     if engine == "rapidocr":
         return _text_from_result(_run_engine(image))
     if engine == "trocr":
         return _trocr_text(image)
+    if engine == "lighton":
+        return _lighton_region(image)
     return _ocria_text(image)
 
 

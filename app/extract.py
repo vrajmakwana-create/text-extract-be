@@ -1,5 +1,7 @@
 import hashlib
 import io
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import pymupdf
@@ -24,6 +26,10 @@ FULL_PAGE_SIDE = 0.8
 # A full-page image on a page with at least this much real text is a background
 # or a searchable scan, so only the text layer is used.
 FULL_PAGE_TEXT_LAYER_CHARS = 80
+
+# Parallel OCR requests per page. LightOnOCR (vLLM) batches concurrent requests,
+# so total throughput grows with this; 1 keeps the old one-at-a-time behaviour.
+OCR_WORKERS = max(1, int(os.environ.get("OCR_WORKERS", "1")))
 
 _COMMON_IMAGE_TYPES = {"png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp"}
 _BLIP = "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
@@ -97,6 +103,7 @@ def extract_image(data: bytes, filename: str = "image.png") -> Extracted:
     blocks = detect_layout_blocks(image)
     if blocks:
         stats.detected_images.extend(save_page_detections(run_dir, 1, image, blocks))
+        _prefetch_ocr(lambda probe, s: _pieces_from_image_blocks(image, blocks, probe, s), cache)
         pieces = _pieces_from_image_blocks(image, blocks, cache, stats)
         if _has_content(pieces):
             stats.scanned_pages = 1
@@ -254,18 +261,22 @@ def _extract_pdf_page(
         stats.detected_images.extend(
             save_page_detections(run_dir, page_number, rendered, blocks)
         )
-        pieces = _pieces_from_layout_blocks(
-            page=page,
-            page_number=page_number,
-            blocks=blocks,
-            rendered=rendered,
-            scale=scale,
-            words=words,
-            cache=cache,
-            stats=stats,
-            text_chars=text_chars,
-            page_area=page_area,
-        )
+        def walk(block_cache, block_stats):
+            return _pieces_from_layout_blocks(
+                page=page,
+                page_number=page_number,
+                blocks=blocks,
+                rendered=rendered,
+                scale=scale,
+                words=words,
+                cache=block_cache,
+                stats=block_stats,
+                text_chars=text_chars,
+                page_area=page_area,
+            )
+
+        _prefetch_ocr(walk, cache)
+        pieces = walk(cache, stats)
         if _has_content(pieces):
             return pieces
 
@@ -434,13 +445,47 @@ def _best_block_text(digital: str, ocr_text: str, label: str) -> str:
     return ocr_text if len(ocr_text) > len(digital) else digital
 
 
+class _OcrProbe(dict):
+    """A cache stand-in that records the crops a block walk would OCR."""
+
+    # Non-empty so the dry run takes the same branches as a successful read
+    # and does not queue the upscaled heading retries.
+    PLACEHOLDER = "pending"
+
+    def __init__(self, cache: dict[str, str]):
+        super().__init__(cache)
+        self.pending: dict[str, Image.Image] = {}
+
+
+def _prefetch_ocr(walk, cache: dict[str, str]) -> None:
+    """Dry-run walk(cache, stats) to find its OCR crops, then OCR them in parallel.
+
+    The real walk that follows finds every result in the cache, so block order
+    and all decisions stay exactly as in the one-at-a-time path.
+    """
+    if OCR_WORKERS <= 1:
+        return
+    probe = _OcrProbe(cache)
+    walk(probe, Stats())
+    if not probe.pending:
+        return
+    keys = list(probe.pending)
+    with ThreadPoolExecutor(min(OCR_WORKERS, len(keys))) as pool:
+        for key, text in zip(keys, pool.map(ocr_region, probe.pending.values())):
+            cache[key] = text
+
+
 def _ocr_crop(crop: Image.Image, cache: dict[str, str]) -> str:
     buffer = io.BytesIO()
     crop.save(buffer, format="PNG")
     raw = buffer.getvalue()
     key = hashlib.sha1(raw).hexdigest()
-    if key not in cache:
-        cache[key] = ocr_region(crop)
+    if key in cache:
+        return cache[key]
+    if isinstance(cache, _OcrProbe):
+        cache.pending[key] = crop
+        return _OcrProbe.PLACEHOLDER
+    cache[key] = ocr_region(crop)
     return cache[key]
 
 
