@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -32,9 +33,12 @@ DETECTED_ROOT.mkdir(parents=True, exist_ok=True)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "https://text-extraction-worker.netlify.app"
+        origin.strip()
+        for origin in os.environ.get(
+            "CORS_ORIGINS",
+            "http://localhost:5173,http://127.0.0.1:5173,https://text-extraction-worker.netlify.app",
+        ).split(",")
+        if origin.strip()
     ],
     allow_methods=["*"],
     allow_headers=["*"],

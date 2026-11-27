@@ -350,7 +350,6 @@ def _pieces_from_layout_blocks(
             "formula_caption",
         }
         crop = _crop_block(rendered, block.bbox, pad=8 if heading else 3)
-        ocr_text = _ocr_crop(crop, cache) if crop is not None else ""
 
         block_words = _words_in_bbox(words, page_bbox, used_words)
         digital = ""
@@ -358,6 +357,11 @@ def _pieces_from_layout_blocks(
             for index, _word in block_words:
                 used_words.add(index)
             digital = _lines_from_words(block_words)
+
+        # _best_block_text keeps the PDF text layer for body blocks with 12+ chars,
+        # so OCR there would be discarded; only OCR when it can change the result.
+        needs_ocr = heading or len(digital.strip()) < 12
+        ocr_text = _ocr_crop(crop, cache) if crop is not None and needs_ocr else ""
 
         text = _best_block_text(digital, ocr_text, block.label)
         if text:

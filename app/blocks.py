@@ -142,7 +142,13 @@ def _get_session():
             from huggingface_hub import hf_hub_download
 
             path = hf_hub_download(repo_id=_MODEL_REPO, filename=_MODEL_FILE)
-            session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+            from app.ocr import _use_cuda
+
+            providers = ["CPUExecutionProvider"]
+            if _use_cuda():
+                providers.insert(0, ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "DEFAULT"}))
+            session = ort.InferenceSession(path, providers=providers)
+            _log.info("Layout model providers: %s", session.get_providers())
             meta = session.get_modelmeta().custom_metadata_map
             names = ast.literal_eval(meta.get("names", "{}"))
             _names = {int(key): str(value) for key, value in names.items()}
